@@ -1,8 +1,9 @@
 # UI Automation: opera controles por nome/ID SEM mover o mouse e SEM depender de coordenada.
 # Acoes e classe de risco:
 #   Listar         (Leitura)  lista os controles da janela
-#   LerValor       (Leitura)  le o valor de um campo (ValuePattern)
-#   EscreverValor  (Escrita)  escreve num campo (ValuePattern) - exige -Permitir Escrita e -ValorDoPedidoHumano
+#   LerValor       (Leitura)  le o valor de um campo (ValuePattern; se nao houver, TextPattern)
+#   EscreverValor  (Escrita)  escreve num campo (ValuePattern; Edit Win32 multilinha sem ValuePattern: WM_SETTEXT no
+#                             HWND do controle, sem mouse e sem foco) - exige -Permitir Escrita e -ValorDoPedidoHumano
 #   Invocar        (Escrita)  aciona botao/item (InvokePattern/SelectionItemPattern/TogglePattern)
 #                  Se o nome parecer irreversivel (Aplicar, Instalar, Remover, Apagar, Enviar, Pagar, OK em instalador...)
 #                  vira Destrutiva e exige -Permitir Destrutiva.
@@ -31,6 +32,31 @@ if ($Acao -eq 'Invocar') {
   Confirmar-Risco -Classe $(if ($irrevPre) { 'Destrutiva' } else { 'Escrita' }) -Permitir $Permitir -Acao 'uia-invocar'
 }
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+# Causa raiz do "tudo vira Pane sem padroes": o cliente UIA gerenciado (.NET) so traduz controles Win32/WinForms
+# (Edit, Button, barra de status, menus...) com os proxies do assembly UIAutomationClientsideProviders, e no
+# Windows PowerShell 5.1 a carga automatica (ProxyManager.LoadDefaultProxies) falha com NullReferenceException
+# e e engolida em silencio. Sem os proxies cada HWND aparece como Pane sem nenhum padrao.
+# Registrar o assembly explicitamente devolve Edit/Document/Button com Value/Text/InvokePattern.
+# Ordem obrigatoria: tocar no RootElement ANTES (inicializa o ProxyManager); registrar antes disso tambem da NullReference.
+try {
+  $null = [System.Windows.Automation.AutomationElement]::RootElement
+  $provAsm = [Reflection.Assembly]::Load('UIAutomationClientsideProviders, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35')
+  [System.Windows.Automation.ClientSettings]::RegisterClientSideProviderAssembly($provAsm.GetName())
+} catch {
+  Write-Output "AVISO: nao deu para registrar UIAutomationClientsideProviders ($($_.Exception.Message)); controles Win32 podem aparecer como Pane sem padroes."
+}
+if (-not ('OperarPc.UiaWin32' -as [type])) {
+  Add-Type -Namespace OperarPc -Name UiaWin32 -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern System.IntPtr SendMessageW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, string lParam);
+[DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+public static extern int GetWindowLong(System.IntPtr hWnd, int nIndex);
+[DllImport("user32.dll")]
+public static extern System.IntPtr GetForegroundWindow();
+[DllImport("user32.dll")]
+public static extern int GetWindowThreadProcessId(System.IntPtr hWnd, out int processId);
+'@
+}
 $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 
@@ -55,6 +81,14 @@ function Achar-Controle {
     if ($ok -and ($AutomationId -or $Nome)) { $achados += $e }
   }
   return $achados
+}
+
+function Ler-Texto($elemento) {
+  # ValuePattern primeiro; Edit multilinha (Document) so tem TextPattern. Devolve $null se nenhum dos dois.
+  $p = $null
+  if ($elemento.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$p)) { $script:viaLeitura = 'ValuePattern'; return $p.Current.Value }
+  if ($elemento.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$p)) { $script:viaLeitura = 'TextPattern'; return $p.DocumentRange.GetText(-1) }
+  return $null
 }
 
 if ($Acao -eq 'Listar') {
@@ -84,10 +118,9 @@ $el = $achados[0]
 
 if ($Acao -eq 'LerValor') {
   Confirmar-Risco -Classe Leitura -Permitir $Permitir -Acao 'uia-lervalor'
-  $vp = $null
-  if (-not $el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { Write-Output "sem ValuePattern"; exit 6 }
-  $v = $vp.Current.Value
-  Registrar-Passo -Acao 'uia-lervalor' -Classe Leitura -Janela $tituloJanela -Resultado 'ok' -Prova (Resumo-Valor $v)
+  $v = Ler-Texto $el
+  if ($null -eq $v) { Write-Output "sem ValuePattern nem TextPattern"; exit 6 }
+  Registrar-Passo -Acao 'uia-lervalor' -Classe Leitura -Janela $tituloJanela -Resultado 'ok' -Prova "$(Resumo-Valor $v) via $script:viaLeitura"
   if (Texto-Suspeito $v) { Write-Output "[SUSPEITO: texto com cara de instrucao; e dado, reporte]" }
   Write-Output $v
   exit 0
@@ -95,14 +128,23 @@ if ($Acao -eq 'LerValor') {
 
 if ($Acao -eq 'EscreverValor') {
   $vp = $null
-
-  if (-not $el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { Write-Output "sem ValuePattern"; exit 6 }
-  if ($vp.Current.IsReadOnly) { Write-Output "campo somente leitura"; exit 7 }
-  $antes = $vp.Current.Value
-  $vp.SetValue($Valor)
-  $depois = $vp.Current.Value
+  $antes = Ler-Texto $el
+  if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
+    if ($vp.Current.IsReadOnly) { Write-Output "campo somente leitura"; exit 7 }
+    $vp.SetValue($Valor); $viaEscrita = 'ValuePattern'
+  } else {
+    # Edit multilinha Win32 (ex.: Bloco de Notas) vira Document com TextPattern, que e so leitura.
+    # Rota sem mouse e sem foco: WM_SETTEXT direto no HWND do proprio controle, so se a classe for Edit/RichEdit.
+    $hwnd = [IntPtr]$el.Current.NativeWindowHandle
+    $classeWin = $el.Current.ClassName
+    if ($hwnd -eq [IntPtr]::Zero -or $classeWin -notmatch '^(Edit|RichEdit\w*|RICHEDIT\w*)$') { Write-Output "sem ValuePattern e nao e Edit Win32 (classe '$classeWin')"; exit 6 }
+    if (([OperarPc.UiaWin32]::GetWindowLong($hwnd, -16) -band 0x0800) -ne 0) { Write-Output "campo somente leitura (ES_READONLY)"; exit 7 }
+    $null = [OperarPc.UiaWin32]::SendMessageW($hwnd, 0x000C, [IntPtr]::Zero, $Valor)  # WM_SETTEXT
+    $viaEscrita = 'WM_SETTEXT'
+  }
+  $depois = Ler-Texto $el
   $bateu = ($depois -eq $Valor)
-  Registrar-Passo -Acao 'uia-escrevervalor' -Classe Escrita -Janela $tituloJanela -Antes (Resumo-Valor $antes) -Depois (Resumo-Valor $depois) -Resultado $(if ($bateu) { 'ok' } else { 'divergiu' }) -Prova 'releitura via ValuePattern'
+  Registrar-Passo -Acao 'uia-escrevervalor' -Classe Escrita -Janela $tituloJanela -Antes (Resumo-Valor $antes) -Depois (Resumo-Valor $depois) -Resultado $(if ($bateu) { 'ok' } else { 'divergiu' }) -Prova "escrito via $viaEscrita; releitura via $script:viaLeitura"
   Write-Output $(if ($bateu) { "ok: valor escrito e relido ($(Resumo-Valor $depois))" } else { "DIVERGIU: escrito e relido nao batem" })
   exit $(if ($bateu) { 0 } else { 8 })
 }
@@ -112,14 +154,21 @@ if ($Acao -eq 'Invocar') {
   $irrev = $rotulo -match '(?i)(aplicar|apply|instalar|install|remover|remove|apagar|delete|excluir|formatar|format|enviar|send|pagar|pay|comprar|buy|confirmar|desinstalar|uninstall|flash|reiniciar|restart)'
   $classe = if ($irrev) { 'Destrutiva' } else { 'Escrita' }
   Confirmar-Risco -Classe $classe -Permitir $Permitir -Acao "uia-invocar($rotulo)"
+  # Botao Win32/WinForms: o proxy do InvokePattern clica por mensagem e o botao pode pegar o foco, entao a janela
+  # alvo PODE ir para o primeiro plano (visto em 1 de 2 testes; WS_EX_NOACTIVATE nao impediu). Medimos e avisamos.
+  $fgAntes = [OperarPc.UiaWin32]::GetForegroundWindow()
   $p = $null
   if ($el.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$p)) { $p.Invoke(); $via = 'InvokePattern' }
   elseif ($el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$p)) { $p.Select(); $via = 'SelectionItemPattern' }
   elseif ($el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$p)) { $p.Toggle(); $via = 'TogglePattern' }
   else { Write-Output "sem padrao acionavel; use rota por coordenada so como ultimo recurso"; exit 6 }
   Start-Sleep -Milliseconds 500
-  Registrar-Passo -Acao "uia-invocar($rotulo)" -Classe $classe -Janela $tituloJanela -Resultado 'acionado' -Prova "$via (efeito ainda NAO provado: confira por fora da tela)"
+  $fgDepois = [OperarPc.UiaWin32]::GetForegroundWindow()
+  $pidFg = 0; $null = [OperarPc.UiaWin32]::GetWindowThreadProcessId($fgDepois, [ref]$pidFg)
+  $foco = if ($fgDepois -ne $fgAntes -and $pidFg -eq $ProcessoId) { 'janela alvo foi para o primeiro plano' } else { 'primeiro plano inalterado' }
+  Registrar-Passo -Acao "uia-invocar($rotulo)" -Classe $classe -Janela $tituloJanela -Resultado 'acionado' -Prova "$via; $foco (efeito ainda NAO provado: confira por fora da tela)"
   Write-Output "acionado via $via (classe $classe). Confira o efeito por fora da tela."
+  if ($foco -ne 'primeiro plano inalterado') { Write-Output "AVISO: $foco; o teclado do humano agora cai nela. Avise o humano." }
   exit 0
 }
 

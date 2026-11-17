@@ -63,12 +63,25 @@ Testado (Windows 10, Windows PowerShell 5.1):
 - Sintaxe dos 5 scripts por `Parser.ParseFile`: 0 erros.
 - Guarda de risco: `EscreverValor` sem `-Permitir`, sem `-ValorDoPedidoHumano`, `Invocar "Instalar driver"` só com Escrita, `clicar-na-janela` e `abrir-como-admin` sem permissão: todos saem com código 10.
 - `capturar-tela.ps1`: captura da tela virtual (exit 0).
-- `uia.ps1 -Acao Listar` contra o Bloco de Notas e contra um formulário WinForms próprio: enumera a janela sem mexer no mouse (exit 0).
+- `uia.ps1 -Acao Listar` contra o Bloco de Notas e contra um formulário WinForms próprio: enumera os controles com tipo e padrões reais (`Document`/`TextPattern` no Bloco de Notas; `Edit`/`ValuePattern` e `Button`/`InvokePattern` no formulário), sem mexer no mouse (exit 0).
+- **Ciclo ao vivo do `uia.ps1`**, sem mouse e sem coordenada, só em processos abertos pelo próprio teste (fechados pelo PID, sem salvar):
+  - Bloco de Notas: `EscreverValor -Permitir Escrita -ValorDoPedidoHumano` (exit 0, escrito via `WM_SETTEXT` no HWND do Edit e relido via `TextPattern`) e `LerValor` devolve o mesmo texto (exit 0).
+  - Formulário WinForms com TextBox e Button: `EscreverValor` (exit 0, via `ValuePattern`), `LerValor` devolve o mesmo texto (exit 0), `Invocar` no botão (exit 0) e o handler do botão gravou um arquivo com o valor, conferido por fora da tela.
+  - Guarda: `EscreverValor` e `Invocar` sem `-Permitir` saem com código 10.
+
+### Por que antes tudo virava `Pane`
+No Windows PowerShell 5.1 o cliente UI Automation gerenciado (`System.Windows.Automation`) não carrega sozinho os proxies de controles Win32/WinForms (`UIAutomationClientsideProviders`): a carga automática (`ProxyManager.LoadDefaultProxies`) dá `NullReferenceException` e é engolida em silêncio. Sem proxies, cada HWND aparece como `Pane` sem padrões. O `uia.ps1` agora toca no `RootElement` e registra o assembly com `ClientSettings.RegisterClientSideProviderAssembly` (nessa ordem: registrar antes do primeiro uso também dá `NullReferenceException`).
+
+### Efeitos colaterais conhecidos
+- `Invocar` em botão Win32/WinForms **pode trazer a janela alvo para o primeiro plano** (o proxy clica por mensagem e o botão pega o foco); visto em 1 de 2 testes, mesmo com a janela criada sem ativação. O script mede o primeiro plano antes e depois, registra e avisa: depois disso o teclado do humano cai na janela alvo.
+- Edit multilinha Win32 (ex.: Bloco de Notas) não tem `ValuePattern`; a escrita usa `WM_SETTEXT` direto no controle (só classes Edit/RichEdit, recusa campo `ES_READONLY`) e a leitura usa `TextPattern`.
 
 **Não testado / sem prova:**
-- `EscreverValor`, `LerValor` e `Invocar` **ao vivo**: neste ambiente de teste o UI Automation devolveu os controles como `Pane` sem padrões (nem `ValuePattern` no campo do Bloco de Notas), então a escrita/leitura estruturada não pôde ser comprovada. O código segue a API documentada, mas trate como **não verificado** até testar no seu ambiente.
-- `abrir-como-admin.ps1` com UAC real, e o clique elevado (UIPI), não foram executados.
-- `clicar-na-janela.ps1` ao vivo não foi executado (não se mexeu no mouse durante os testes).
+- `uia.ps1` contra apps WPF, UWP/WinUI, navegadores e apps de desenho próprio (só Win32 clássico e WinForms foram provados).
+- `SelectionItemPattern` e `TogglePattern` no `Invocar` (só `InvokePattern` foi provado).
+- UAC e UIPI: janela elevada operada a partir de processo sem admin.
+- `abrir-como-admin.ps1` com UAC real não foi executado.
+- Clique por coordenada (`clicar-na-janela.ps1`) ao vivo não foi executado (não se mexeu no mouse durante os testes).
 - Execução em PowerShell 7 e em Windows 11.
 
 ## Referências (só inspiração de ideias, nenhum código copiado)
